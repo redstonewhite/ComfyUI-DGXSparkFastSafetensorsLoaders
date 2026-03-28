@@ -55,3 +55,58 @@ Restart ComfyUI. The nodes appear in the **loaders** category.
 ## Acknowledgements
 
 Original `DGXSparkSafetensorsLoader` node and idea by [Phaserblast](https://github.com/phaserblast) — [ComfyUI-DGXSparkSafetensorsLoader](https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader), licensed under the Apache License 2.0.
+
+
+## Custom Loader in Workflow?
+
+If your workflow contains custom nodes that does not support an external loader, you may try the following to integrate `fastsafetensors` to your ComfyUI.
+
+1. Go to `/path/to/your/ComfyUI`, find `utils.py` under `comfy`. Open it, and make the following edit as noted:
+
+```python
+def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+    if device is None:
+        device = torch.device("cpu")
+    metadata = None
+    if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
+        try:
+            if comfy.memory_management.aimdo_enabled:
+                sd, metadata = load_safetensors(ckpt)
+                if not return_metadata:
+                    metadata = None
+            else:
+                # =========== Begin Insertion ===========
+                with fastsafe_open(filenames=[ckpt], nogds=False, device=device) as f:
+                    sd = {}
+                    for k in f.keys():
+                        tensor = f.get_tensor(k).clone().detach()
+                        sd[k] = tensor
+                    if return_metadata:
+                        metadata = f.metadata()
+                # ============ End Insertion ============
+
+                # ======= Comment Out Followings =======
+                # with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
+                #     sd = {}
+                #     for k in f.keys():
+                #         tensor = f.get_tensor(k)
+                #         if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
+                #             tensor = tensor.to(device=device, copy=True)
+                #         sd[k] = tensor
+                #     if return_metadata:
+                #         metadata = f.metadata()
+                # ======= Comment Out Above =======
+        
+        # ========== Rest Untouched ===========
+        except Exception as e:
+            if len(e.args) > 0:
+                message = e.args[0]
+                if "HeaderTooLarge" in message:
+                    raise ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt or invalid. Make sure this is actually a safetensors file and not a ckpt or pt or other filetype.".format(message, ckpt))
+                if "MetadataIncompleteBuffer" in message:
+                    raise ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt/incomplete. Check the file size and make sure you have copied/downloaded it correctly.".format(message, ckpt))
+            raise e
+        # And more ...
+```
+
+The above code is not fully tested, but works fine on my machine. USE THEM AT YOUR OWN RISK
