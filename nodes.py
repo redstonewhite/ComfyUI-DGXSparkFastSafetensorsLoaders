@@ -1,6 +1,13 @@
+# Copyright (c) 2025 Phaserblast
+# Licensed under the Apache License, Version 2.0
 # https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader
-# Copyright (c) 2025 Phaserblast. All rights reserved.
-# Released under the Apache 2.0 license.
+
+# Modifications Copyright (c) 2026 RedstoneWhite
+# This file has been substantially modified and extended.
+
+# Project repository:
+# https://github.com/redstonewhite/ComfyUI-DGXSparkFastSafetensorsLoaders
+
 import gc
 import logging
 import torch

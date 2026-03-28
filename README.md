@@ -1,32 +1,44 @@
-# ComfyUI-DGXSparkSafetensorsLoader
-**A ComfyUI model loader that uses the [fastsafetensors](https://github.com/foundation-model-stack/fastsafetensors) library to perform a very fast, zero-copy load from storage to VRAM.**
+# ComfyUI-DGXSparkFastSafetensorsLoaders
 
-_This is very experimental, and may destroy the universe. So please don't use it in a production environment under any circumstances._
+> **Use at your own risk. No stability guarantee**
 
-On DGX Spark, fastsafetensors is a massive improvement over the Hugging Face safetensors library for loading AI models. The Hugging Face library doesn't work well with the DGX Spark due to its architecture and memory design. Models load very slowly and sometimes use up to 2x memory during loading. This can cause large models to exceed the Spark's RAM capacity and fail, even when the model should fit in under half of the machine's RAM capacity.
+An extended version of [ComfyUI-DGXSparkSafetensorsLoader](https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader) by [Phaserblast](https://github.com/phaserblast). This repo adds more nodes to support drop-in alternatives for Checkpoint Loader, CLIP Loader and VAE Loader, as well as a Model Unloader to free VRAM without the need to restart the server.
 
-This node doesn't require ComfyUI to be launched with the --cache-none or --disable-mmap options. The default options should work fine.
+This custom node collection loads `.safetensors` model files into ComfyUI using the [fastsafetensors](https://github.com/foundation-model-stack/fastsafetensors) library, which performs fast, zero-copy transfers from storage directly to VRAM via NVIDIA GPUDirect. It is optimized for the NVIDIA DGX Spark's unified memory architecture, where the standard Hugging Face `safetensors` library can be slow and may transiently use up to 2× the model's size in RAM during loading.
 
-Here's an example of memory usage during and after loading the 60GB FLUX.2-dev BF16 model to the GPU and the 17GB Mistral FP8 text encoder to the CPU. As you can see, model loading happens extremely fast and memory usage never goes over 60%:
+In my workflows with Qwen Image Edit, Wan 2.2 Animate and FireRed 1.1, it reduces loading time to ~5s total.
 
-![FLUX.2-dev memory usage](https://github.com/user-attachments/assets/6a3a4ff7-bc4e-47ea-99b7-d4961b505a01)
+## Nodes
 
-# How to Install
-Clone this repository into your ComfyUI/custom_nodes folder:
-```
+| Node | Description |
+|---|---|
+| **DGX Spark Safetensors Loader** | Loads a diffusion model (UNet / DiT) from `diffusion_models/` |
+| **DGX Spark Checkpoint Loader** | Loads a full checkpoint (model + CLIP + VAE) from `checkpoints/` |
+| **DGX Spark CLIP Loader** | Loads a CLIP / text encoder from `text_encoders/` |
+| **DGX Spark VAE Loader** | Loads a VAE from `vae/` |
+| **DGX Spark Model Unloader** | Explicitly frees fastsafetensors GPU memory for a loaded model |
+
+All loader nodes cache loaded models in a global registry so re-running a workflow does not reload the file from disk. The **DGX Spark Model Unloader** node allows explicit VRAM reclamation without restarting ComfyUI. This addresses the memory-management limitation present in the original implementation.
+
+## Installation
+
+```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader.git
+git clone https://github.com/redstonewhite/ComfyUI-DGXSparkFastSafetensorsLoaders.git
 ```
-Install the fastsafetensors Python package. If you use a Python venv, remember activate it first:
-```
-source venv/bin/activate
+
+Install the dependency (activate your venv first if applicable):
+
+```bash
 pip install fastsafetensors
 ```
-Restart ComfyUI, and search for the "DGX Spark Safetensors Loader" node. It should also be in the "loaders" category. Use this node in place of ComfyUI's built-in "Load Diffusion Model" node.
 
-# Known Issues
-* Memory management is broken, as there is no way to free the memory allocated by fastsafetensors. This is due to the custom memory management used by fastsafetensors, which bypasses ComfyUI's built-in memory management. The workaround is to just quit and restart ComfyUI to clear VRAM.
+Restart ComfyUI. The nodes appear in the **loaders** category.
 
-* Quantized models don't work. Use the FP16 versions. If you need to use a quantized model, just use ComfyUI's Load Diffusion Model node instead.
+## Notes
 
-* Only minimal testing has been done on machines with discrete GPUs.
+- Tested with `--disable-mmap` and `--gpu-only` flags, though they might be unnecessary.
+
+## Acknowledgements
+
+Original node by [Phaserblast](https://github.com/phaserblast) — [ComfyUI-DGXSparkSafetensorsLoader](https://github.com/phaserblast/ComfyUI-DGXSparkSafetensorsLoader), licensed under the Apache License 2.0.
