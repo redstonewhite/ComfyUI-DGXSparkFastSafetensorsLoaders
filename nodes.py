@@ -10,6 +10,7 @@
 
 import gc
 import logging
+from contextlib import contextmanager
 import torch
 import folder_paths
 import comfy
@@ -45,6 +46,28 @@ def _fastsafe_load(file_path, device):
     for k in fb.key_to_rank_lidx.keys():
         sd[k] = fb.get_tensor(k)
     return sd, metadata, fb, loader
+
+
+@contextmanager
+def _force_assign_true():
+    """Temporarily make ModelPatcher.is_dynamic() return True so that all
+    load_state_dict calls inside ComfyUI's loading pipeline use assign=True.
+    This prevents tensor duplication when fastsafetensors already placed
+    the data in VRAM (unified memory on DGX Spark)."""
+    orig = comfy.model_patcher.ModelPatcher.is_dynamic
+    comfy.model_patcher.ModelPatcher.is_dynamic = lambda self: True
+    try:
+        yield
+    finally:
+        comfy.model_patcher.ModelPatcher.is_dynamic = orig
+
+
+def _fix_patcher_for_dgx(patcher, dev):
+    """Adjust a ModelPatcher for DGX Spark unified memory: set offload
+    device equal to load device so ComfyUI never tries to move weights."""
+    if patcher is not None:
+        patcher.load_device = dev
+        patcher.offload_device = dev
 
 
 def _clear_nn_params(module):
@@ -190,6 +213,9 @@ class DGXSparkSafetensorsLoader:
         )
         if len(temp_sd) > 0:
             sd = temp_sd
+
+        sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
+
         model_config = comfy.model_detection.model_config_from_unet(
             sd, "", metadata=metadata
         )
@@ -197,16 +223,39 @@ class DGXSparkSafetensorsLoader:
             fb.close()
             loader.close()
             raise RuntimeError("Couldn't detect model type.")
-        model_dtype = comfy.utils.weight_dtype(sd, "")
-        model_config.set_inference_dtype(model_dtype, torch.bfloat16)
-        model = model_config.get_model(sd, "", device=None)
 
-        model = model.to(None)
+        parameters = comfy.utils.calculate_parameters(sd)
+        weight_dtype = comfy.utils.weight_dtype(sd, "")
+
+        unet_weight_dtype = list(model_config.supported_inference_dtypes)
+        if model_config.quant_config is not None:
+            weight_dtype = None
+
+        unet_dtype = comfy.model_management.unet_dtype(
+            model_params=parameters,
+            supported_dtypes=unet_weight_dtype,
+            weight_dtype=weight_dtype,
+        )
+
+        if model_config.quant_config is not None:
+            manual_cast_dtype = comfy.model_management.unet_manual_cast(
+                None, dev, model_config.supported_inference_dtypes
+            )
+        else:
+            manual_cast_dtype = comfy.model_management.unet_manual_cast(
+                unet_dtype, dev, model_config.supported_inference_dtypes
+            )
+        model_config.set_inference_dtype(unet_dtype, manual_cast_dtype)
+
+        if model_config.optimizations.get("fp8", False):
+            model_config.optimizations["fp8"] = True
+
+        model = model_config.get_model(sd, "", device=None)
         sd = model_config.process_unet_state_dict(sd)
         model.diffusion_model.load_state_dict(sd, strict=False, assign=True)
 
         model_patcher = comfy.model_patcher.ModelPatcher(
-            model, load_device=dev, offload_device=None
+            model, load_device=dev, offload_device=dev
         )
 
         _load_counter += 1
@@ -262,25 +311,36 @@ class DGXSparkCheckpointLoader:
             cached = _dgx_registry[key]["outputs"]
             return cached
 
+        dev = torch.device(device)
         ckpt_path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
         sd, metadata, fb, loader = _fastsafe_load(ckpt_path, device)
 
-        # Use ComfyUI's own config guesser which splits sd into model/clip/vae
-        out = comfy.sd.load_state_dict_guess_config(
-            sd,
-            output_vae=True,
-            output_clip=True,
-            output_clipvision=False,
-            embedding_directory=folder_paths.get_folder_paths("embeddings"),
-            output_model=True,
-            metadata=metadata,
-        )
+        # Use ComfyUI's own config guesser which splits sd into model/clip/vae.
+        # Wrap with _force_assign_true so all internal load_state_dict calls
+        # use assign=True, preventing tensor duplication on unified memory.
+        with _force_assign_true():
+            out = comfy.sd.load_state_dict_guess_config(
+                sd,
+                output_vae=True,
+                output_clip=True,
+                output_clipvision=False,
+                embedding_directory=folder_paths.get_folder_paths("embeddings"),
+                output_model=True,
+                metadata=metadata,
+            )
         if out is None:
             fb.close()
             loader.close()
             raise RuntimeError(f"Could not detect model type of: {ckpt_path}")
 
         model_patcher, clip, vae, _clipvision = out
+
+        # Fix patcher devices for DGX Spark unified memory
+        _fix_patcher_for_dgx(model_patcher, dev)
+        if clip is not None:
+            _fix_patcher_for_dgx(clip.patcher, dev)
+        if vae is not None:
+            _fix_patcher_for_dgx(vae.patcher, dev)
 
         # Track all patcher objects for cleanup
         tracked = []
@@ -367,6 +427,7 @@ class DGXSparkCLIPLoader:
         if key in _dgx_registry:
             return (_dgx_registry[key]["outputs"][0],)
 
+        dev = torch.device(device)
         clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
         sd, metadata, fb, loader = _fastsafe_load(clip_path, device)
 
@@ -379,11 +440,14 @@ class DGXSparkCLIPLoader:
             comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION
         )
 
-        clip = comfy.sd.load_text_encoder_state_dicts(
-            state_dicts=[sd],
-            embedding_directory=folder_paths.get_folder_paths("embeddings"),
-            clip_type=clip_type,
-        )
+        with _force_assign_true():
+            clip = comfy.sd.load_text_encoder_state_dicts(
+                state_dicts=[sd],
+                embedding_directory=folder_paths.get_folder_paths("embeddings"),
+                clip_type=clip_type,
+            )
+
+        _fix_patcher_for_dgx(clip.patcher, dev)
 
         _load_counter += 1
         _dgx_registry[key] = {
@@ -438,11 +502,15 @@ class DGXSparkVAELoader:
         if key in _dgx_registry:
             return (_dgx_registry[key]["outputs"][0],)
 
+        dev = torch.device(device)
         vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
         sd, metadata, fb, loader = _fastsafe_load(vae_path, device)
 
-        vae = comfy.sd.VAE(sd=sd, metadata=metadata)
+        with _force_assign_true():
+            vae = comfy.sd.VAE(sd=sd, metadata=metadata)
         vae.throw_exception_if_invalid()
+
+        _fix_patcher_for_dgx(vae.patcher, dev)
 
         _load_counter += 1
         _dgx_registry[key] = {
