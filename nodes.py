@@ -47,15 +47,19 @@ def _fastsafe_load(file_path, device):
     sd = {}
     for k in fb.key_to_rank_lidx.keys():
         sd[k] = fb.get_tensor(k)
-    _move_tokenizer_tensors_to_cpu(sd)
+    _move_aux_tensors_to_cpu(sd)
     return sd, metadata, fb, loader
 
 
-def _move_tokenizer_tensors_to_cpu(sd):
+def _move_aux_tensors_to_cpu(sd):
     for key, value in list(sd.items()):
         if not torch.is_tensor(value):
             continue
-        if key.endswith("spiece_model") or key.endswith("tekken_model"):
+        if (
+            key.endswith("spiece_model")
+            or key.endswith("tekken_model")
+            or key.endswith("comfy_quant")
+        ):
             sd[key] = value.detach().cpu()
 
 
