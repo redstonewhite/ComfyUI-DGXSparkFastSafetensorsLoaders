@@ -40,15 +40,41 @@ def _fastsafe_load(file_path, device):
     """Load a .safetensors file with fastsafetensors, returning (sd, metadata, fb, loader).
     The caller MUST keep fb and loader alive as long as the tensors are in use."""
     dev = torch.device(device)
-    loader = SafeTensorsFileLoader(SingleGroup(), dev)
-    loader.add_filenames({0: [file_path]})
-    metadata = loader.meta[file_path][0].metadata or {}
-    fb = loader.copy_files_to_device()
-    sd = {}
-    for k in fb.key_to_rank_lidx.keys():
-        sd[k] = fb.get_tensor(k)
-    _move_aux_tensors_to_cpu(sd)
-    return sd, metadata, fb, loader
+    loader = None
+    fb = None
+    try:
+        loader = SafeTensorsFileLoader(SingleGroup(), dev)
+        loader.add_filenames({0: [file_path]})
+        metadata = loader.meta[file_path][0].metadata or {}
+        fb = loader.copy_files_to_device()
+        sd = {}
+        for k in fb.key_to_rank_lidx.keys():
+            sd[k] = fb.get_tensor(k)
+        _move_aux_tensors_to_cpu(sd)
+        return sd, metadata, fb, loader
+    except KeyError as e:
+        if str(e) != "'data_offsets'":
+            raise
+        logging.warning(
+            "[DGXSpark] fastsafetensors could not parse %s (%s). Falling back to ComfyUI safetensors loading for this file.",
+            file_path,
+            e,
+        )
+        if fb is not None:
+            try:
+                fb.close()
+            except Exception:
+                pass
+        if loader is not None:
+            try:
+                loader.close()
+            except Exception:
+                pass
+        sd, metadata = comfy.utils.load_torch_file(
+            file_path, safe_load=True, return_metadata=True
+        )
+        _move_aux_tensors_to_cpu(sd)
+        return sd, metadata, None, None
 
 
 def _move_aux_tensors_to_cpu(sd):
